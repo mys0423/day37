@@ -2,7 +2,7 @@ import asyncio
 import hashlib
 import io
 import json
-import os
+import math
 import struct
 import tempfile
 import time
@@ -13,17 +13,28 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv
+import sys
 
-load_dotenv()  # .env 로딩
+# 최신 av와 faster-whisper 사이의 metadata_errors 충돌을 원천 차단합니다.
+import av
+_original_open = av.open
+def _patched_open(*args, **kwargs):
+    kwargs.pop('metadata_errors', None)  # 에러를 유발하는 옵션만 몰래 제거
+    return _original_open(*args, **kwargs)
+av.open = _patched_open
 
-# 입력 파일 최대 크기를 10Mbytes로 제한
+
+# 상위 폴더 경로 추가 (include, util 모듈 인식용)
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+
+ROOT = Path(__file__).resolve().parent
+
+LOG_PATH = ROOT / "voice_runs_campus.jsonl"
+
+# 에러 수정: 정상적인 곱셈 연산으로 변경
 MAX_BYTES = 10 * 1024 * 1024
 
-# 실행이력을 저장할 jsonl파일 경로
-LOG_PATH = Path(__file__).with_name('voice_runs_campus.jsonl')
-
-# 시설 운영 정보 딕셔너리
 FACILITIES = {
     "도서관": "도서관은 본관 옆 건물이며 평일 9시부터 18시까지 운영합니다.",
     "학생식당": "학생식당은 학생회관 1층에 있으며 11시부터 14시까지 운영합니다.",
@@ -31,244 +42,182 @@ FACILITIES = {
     "행정실": "행정실은 본관 1층이며 각종 증명서 발급을 안내합니다.",
 }
 
-# 실제 WAV 파일인지 확인하고 기본 정보를 추출하는 함수
-def validate_wav(audio):
-    try:
-        with wave.open(io.BytesIO(audio), 'rb') as wav:
-            channels = wav.getnchannels()
-            sample_rate = wav.getframerate()
-            sample_width = wav.getsampwidth()
-            frames = wav.getnframes()
-            compression = wav.getcomptype()
-    except (wave.Error, EOFError, OSError) as e:
-        raise ValueError('유효한 비압축 PCM WAV 파일을 입력해 주세요.') from e
 
-    if compression != 'NONE' or channels not in (1, 2) or sample_rate < 0 or frames <= 0:
-        raise ValueError('모노/스테레오 비압축 PCM WAV 파일이 필요합니다.')
+# 문장 길이로 길이를 정하는 시험용 WAV 생성 함수
+def make_tone(text):
+    rate = 16000  # 1초당 샘플 16,000개
+    duration = min(1.5, max(0.3, len(text) * 0.025))
+    count = int(rate * duration)
+    buffer = io.BytesIO()  # 메모리에 바이너리 데이터를 기록함
 
-    return {
-        'channels': channels,
-        'sample_rate': sample_rate,
-        'bit_depth': sample_width * 8,
-        'duration_sec': round(frames / sample_rate, 2)
-    }
+    with wave.open(buffer, "wb") as writer:
+        writer.setnchannels(1)  # 단일 채널(모노)
+        writer.setsampwidth(2)  # 샘플당 2바이트 = 16비트 PCM
+        writer.setframerate(rate)  # 샘플링 레이트 설정
+
+        # 에러 수정: 곱셈 기호(*) 복구 및 괄호 정리
+        samples = (int(4500 * math.sin(2 * math.pi * 440 * i / rate)) for i in range(count))
+        writer.writeframes(b"".join(struct.pack("<h", s) for s in samples))
+
+    return buffer.getvalue(), "audio/wav"
 
 
-# faster-whisper 모델 로딩
-@st.cache_resource(show_spinner='Whisper 모델을 로딩하고 있습니다...')
-def load_stt_model():
+# 녹음된 WAV의 전사 결과를 반환하는 함수
+def recognize(audio, demo_text, use_real):
+    if not use_real:
+        return demo_text.strip()  # 데모는 녹음 내용을 인식하지 않음
     from faster_whisper import WhisperModel
-    return WhisperModel('base', device='CPU', compute_type='int8')
-
-
-# STT 인식 수행
-def transcribe_wav(audio, use_real_stt):
-    model = load_stt_model()
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-        f.write(audio)
-        wav_path = Path(f.name)
-
+    model = load_whisper()  # 모델은 캐시하여 재다운로드를 줄임
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as file:
+        file.write(audio)
+        path = Path(file.name)
     try:
-        segments, info = model.transcribe(
-            str(wav_path),
-            language='ko',
-            vad_filter=True
-        )
-
-        transcript = ''.join(segment.text.strip() for segment in segments).strip()
-
-        return transcript
-
+        # language='ko': 한국어 인식, beam_size: 탐색 후보의 폭
+        segments, _ = model.transcribe(str(path), language="ko", beam_size=3)
+        return " ".join(part.text.strip() for part in segments).strip()
     finally:
-        wav_path.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)  # 예외 시에도 임시 WAV를 삭제
 
 
-# 시설명 키워드를 찾아 안내하는 응답 생성 함수
-def build_reply(transcript):
-    clean = ''.join(transcript.split())
+# CPU 기반 Whisper tiny 모델을 한 번 생성하고 캐싱하는 함수
+@st.cache_resource(show_spinner="Whisper 모델 준비 중...")
+def load_whisper():
+    from faster_whisper import WhisperModel
+    return WhisperModel("tiny", device="cpu", compute_type="int8")
+
+
+# 질문 내 시설 이름을 기준으로 간단한 안내문을 반환하는 함수
+def answer_question(transcript):
+    clean = " ".join(transcript.split())  # 여러 공백을 하나로 축소
     if not clean:
-        return '음성 인식을 하지 못했습니다. 다시 말씀해 주세요.'
-
-    # 질문에 시설명이 포함되어 있는지 확인
-    for facility, info in FACILITIES.items():
-        if facility in transcript:
-            return info
-
-    return '안내 가능한 시설은 도서관, 학생식당, 취업지원센터, 행정실입니다.'
+        return "음성이 인식되지 않았습니다. 다시 말씀해 주세요."
+    for name, description in FACILITIES.items():
+        if name in clean:
+            return description  # 발견한 첫 시설의 정보를 반환
+    choices = ", ".join(FACILITIES)
+    return f"해당 시설 정보는 없습니다. 안내 가능한 곳은 {choices}입니다."
 
 
-# Edge TTS 실제 합성 함수
-async def generate_tts_mp3(text, voice):
+# 온라인 edge-tts로 문장을 합성한 MP3 바이트를 반환하는 함수
+async def edge_audio(text):
     import edge_tts
-    with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as f:
-        mp3_path = Path(f.name)
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as file:
+        path = Path(file.name)
     try:
-        await edge_tts.Communicate(text=text, voice=voice).save(str(mp3_path))
-        return mp3_path.read_bytes()
+        # Communicate(text, voice): TTS 합성 요청 객체 생성
+        await edge_tts.Communicate(
+            text=text, voice="ko-KR-SunHiNeural"
+        ).save(str(path))  # MP3를 지정한 파일에 저장
+        return path.read_bytes(), "audio/mpeg"
     finally:
-        mp3_path.unlink(missing_ok=True)
-
-def synthesize_speech(text, voice_id):
-    mp3_bytes = asyncio.run(generate_tts_mp3(text, voice_id))
-    return mp3_bytes, 'audio/mpeg'
+        path.unlink(missing_ok=True)
 
 
-# JSONL 및 DB 저장
-def store_meta(meta):
-    with LOG_PATH.open('a', encoding='utf-8') as f:
-        f.write(json.dumps(meta, ensure_ascii=False) + '\n')
-
-    database_url = os.getenv('DATABASE_URL', '').strip()
-    if not database_url:
-        return
-
-    try:
-        import psycopg
-        with psycopg.connect(database_url, connect_timeout=5) as conn:
-            with conn.cursor() as cur:
-                # 독립적인 실습을 위해 campus_voice_runs 테이블 사용
-                cur.execute('''
-                    CREATE TABLE IF NOT EXISTS campus_voice_runs (
-                        request_id TEXT PRIMARY KEY,
-                        created_at TIMESTAMPTZ NOT NULL,
-                        status TEXT NOT NULL,
-                        stt_ms DOUBLE PRECISION NOT NULL,
-                        reply_ms DOUBLE PRECISION NOT NULL,
-                        tts_ms DOUBLE PRECISION NOT NULL,
-                        total_ms DOUBLE PRECISION NOT NULL,
-                        model_version TEXT NOT NULL,
-                        audio_sha256 TEXT NOT NULL
-                    )
-                ''')
-                cur.execute('''
-                    INSERT INTO campus_voice_runs
-                    (request_id, created_at, status, stt_ms, reply_ms, tts_ms, total_ms, model_version, audio_sha256)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ''', (
-                    meta['request_id'], meta['created_at'], meta['status'],
-                    meta['stt_ms'], meta['reply_ms'], meta['tts_ms'],
-                    meta['total_ms'], meta['model_version'], meta['audio_sha256']
-                ))
-    except Exception as e:
-        st.warning(f'DB 실행 이력 저장 실패: {type(e).__name__}: {e}')
+# 실제 TTS 여부에 따라 (음성 bytes, MIME 타입)을 반환하는 함수
+def speak(text, use_real):
+    return asyncio.run(edge_audio(text)) if use_real else make_tone(text)
 
 
-# 파이프라인 함수
-def run_pipeline(audio, use_real_stt, use_real_tts, voice_id):
-    request_id = str(uuid.uuid4())
-    digest = hashlib.sha256(audio).hexdigest()
-    marks = {'stt_ms': 0.0, 'reply_ms': 0.0, 'tts_ms': 0.0}
-    started = time.perf_counter()
-    result = None
-    error = None
-
-    try:
-        t0 = time.perf_counter()
-        transcript = transcribe_wav(audio, use_real_stt)
-        marks['stt_ms'] = (time.perf_counter() - t0) * 1000
-
-        t0 = time.perf_counter()
-        reply = build_reply(transcript)
-        marks['reply_ms'] = (time.perf_counter() - t0) * 1000
-
-        t0 = time.perf_counter()
-        output, mime = synthesize_speech(reply, voice_id, use_real_tts)
-        marks['tts_ms'] = (time.perf_counter() - t0) * 1000
-
-        result = (transcript, reply, output, mime)
-    except Exception as e:
-        error = e
-
-    elapsed = (time.perf_counter() - started) * 1000
-    model_info = f"STT:{'real' if use_real_stt else 'demo'}/TTS:{'real' if use_real_tts else 'demo'}/{voice_id}"
-
-    meta = {
-        'request_id': request_id,
-        'created_at': datetime.now(timezone.utc).isoformat(),
-        'status': 'error' if error else 'success',
-        **{key: round(value, 2) for key, value in marks.items()},
-        'total_ms': round(elapsed, 2),
-        'model_version': model_info,
-        'audio_sha256': digest
-    }
-
-    store_meta(meta)
-    return result, marks, meta, error
+# 개인 발화와 녹음 원본을 제외한 실행 메타데이터를 JSONL로 저장하는 함수
+def save_log(metadata):
+    with LOG_PATH.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(metadata, ensure_ascii=False) + "\n")
 
 
-# Streamlit UI
+# JSONL 마지막 limit건을 DataFrame으로 변환하는 함수
+def recent_logs(limit=10):
+    if not LOG_PATH.exists():
+        return pd.DataFrame()  # 이력 파일이 없다면 빈 데이터프레임
+    with LOG_PATH.open(encoding="utf-8") as file:
+        rows = [json.loads(line) for line in file if line.strip()]
+    return pd.DataFrame(rows[-limit:][::-1])  # 가장 최근 실행부터 표시
+
+
 def main():
-    st.set_page_config(page_title='캠퍼스 시설 안내', layout='centered')
-    st.title('캠퍼스 시설 안내 음성 도우미')
-    st.caption('마이크로 시설 운영에 대해 질문하면 AI가 안내해 드립니다.')
+    st.set_page_config(page_title="캠퍼스 음성 도우미", layout="centered")
+    st.title("캠퍼스 시설 음성 안내")
+    st.caption("시설 안내 내용은 교육용 가상 정보입니다.")
 
-    with st.form('voice_form'):
-        uploaded = st.audio_input('마이크로 질문을 녹음하세요 (예: 도서관 운영시간 알려줘)')
+    with st.form("campus_voice"):
+        audio_input = st.audio_input("시설에 관해 질문을 녹음하세요")
+        demo_text = st.text_input(
+            "데모 STT 예시 문장", "도서관 운영시간 알려줘"
+        )
+        use_stt = st.checkbox("실제 STT 사용 (faster-whisper)")
+        use_tts = st.checkbox("실제 TTS 사용 (edge-tts)")
+        submitted = st.form_submit_button("음성 안내 실행")
 
-        cols = st.columns(2)
-        with cols[0]:
-            use_real_stt = st.toggle('실제 STT 모델 사용 (faster-whisper)', value=False)
-        with cols[1]:
-            use_real_tts = st.toggle('실제 TTS 모델 사용 (edge-tts)', value=False)
+    if submitted:
+        audio = audio_input.getvalue() if audio_input else b""
 
-        voice_id = st.selectbox('TTS 목소리', ['ko-KR-SunHiNeural', 'ko-KR-InJoonNeural'])
-        submitted = st.form_submit_button('안내 방송 생성')
+        if not audio:
+            st.error("음성을 먼저 녹음해 주세요.")
+            return
 
-    # 하단: 최근 이력 표시
-    st.divider()
-    st.subheader('최근 처리 이력')
-    if LOG_PATH.exists():
+        if len(audio) > MAX_BYTES:
+            st.error("입력 파일은 10MiB를 초과할 수 없습니다.")
+            return
+
+        timings = {"stt_ms": 0.0, "reply_ms": 0.0, "tts_ms": 0.0}
+        req_id = str(uuid.uuid4())  # 실행을 구분할 고유 요청 ID
+        digest = hashlib.sha256(audio).hexdigest()  # 원본 대신 해시 저장
+        start = time.perf_counter()  # 벽시계 오차가 없는 시간 측정
+        outcome = None
+        error = None
+
         try:
-            df = pd.read_json(LOG_PATH, lines=True)
-            # 최근 5건 추출 및 보기 좋게 컬럼 정리
-            st.dataframe(df.tail(5)[['created_at', 'status', 'total_ms', 'model_version']], use_container_width=True)
-        except Exception:
-            st.write('이력을 불러올 수 없습니다.')
+            t0 = time.perf_counter()
+            transcript = recognize(audio, demo_text, use_stt)
+            timings["stt_ms"] = (time.perf_counter() - t0) * 1000
+
+            t0 = time.perf_counter()
+            reply = answer_question(transcript)
+            timings["reply_ms"] = (time.perf_counter() - t0) * 1000
+
+            t0 = time.perf_counter()
+            sound, mime = speak(reply, use_tts)
+            timings["tts_ms"] = (time.perf_counter() - t0) * 1000
+
+            outcome = (transcript, reply, sound, mime)
+
+        except Exception as exc:
+            error = exc  # 라이브러리 미설치·네트워크 오류 등 전달
+
+        total = (time.perf_counter() - start) * 1000
+
+        metadata = {
+            "request_id": req_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "status": "error" if error else "success",
+            "stt_model": "whisper-tiny" if use_stt else "demo-stt",
+            "tts_model": "edge-tts" if use_tts else "demo-beep",
+            "audio_sha256": digest,
+            **{key: round(value, 2) for key, value in timings.items()},
+            "total_ms": round(total, 2),
+        }
+
+        save_log(metadata)  # 성공/실패 여부와 무관하게 메타데이터 저장
+
+        if error:
+            st.error(f"실행 실패: {type(error).__name__}: {error}")
+        else:
+            transcript, reply, sound, mime = outcome
+            st.write("**STT 인식 문장:**", transcript)
+            st.write("**안내 답변:**", reply)
+            st.audio(sound, format=mime)  # 브라우저에서 음성 재생
+
+        st.metric("총 처리시간", f"{total:.0f} ms")
+        st.bar_chart(pd.Series(timings))  # STT/응답/TTS 단계별 시간
+        st.json(metadata)  # 개인정보 없는 실행 메타데이터
+        print("음성 처리 완료", req_id, metadata["status"])
+
+    st.subheader("최근 처리 이력")
+    logs = recent_logs(10)
+    if logs.empty:
+        st.info("아직 실행 이력이 없습니다.")
     else:
-        st.write('저장된 실행 이력이 없습니다.')
-
-    if not submitted:
-        return
-
-    if uploaded is None:
-        st.error('먼저 마이크로 음성을 녹음해 주세요.')
-        return
-
-    audio = uploaded.getvalue()
-
-    if not audio or len(audio) > MAX_BYTES:
-        st.error(f'음성 파일 크기는 {MAX_BYTES}바이트 이하여야 합니다.')
-        return
-
-    try:
-        audio_info = validate_wav(audio)
-    except ValueError as e:
-        st.error(str(e))
-        return
-
-    with st.spinner('음성 분석 및 응답 생성 중...'):
-        result, marks, meta, error = run_pipeline(audio, use_real_stt, use_real_tts, voice_id)
-
-    if error:
-        st.error(f'처리 오류: {type(error).__name__}: {error}')
-    else:
-        transcript, reply, output, mime = result
-
-        st.success('처리가 완료되었습니다!')
-
-        st.subheader('인식된 질문')
-        st.info(transcript)
-
-        st.subheader('AI 안내')
-        st.write(reply)
-        st.audio(output, format=mime)
-
-        st.subheader('소요 시간 분석')
-        st.metric('총 처리시간', f"{meta['total_ms']:.0f} ms")
-
-        chart_df = pd.DataFrame([marks])
-        st.bar_chart(chart_df)
+        st.dataframe(logs, use_container_width=True, hide_index=True)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

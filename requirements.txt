@@ -1,7 +1,7 @@
 streamlit
 faster-whisper
 edge-tts
-av>=12.0.0
+av
 pandas
 python-dotenv
 psycopg[binary]
