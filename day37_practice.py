@@ -61,7 +61,7 @@ def load_stt_model():
     return WhisperModel('base', device='CPU', compute_type='int8')
 
 
-# STT 인식 수행 (데모 모드 지원)
+# STT 인식 수행
 def transcribe_wav(audio, use_real_stt):
     model = load_stt_model()
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
@@ -108,20 +108,7 @@ async def generate_tts_mp3(text, voice):
     finally:
         mp3_path.unlink(missing_ok=True)
 
-
-# TTS 합성 수행 (데모 모드 지원)
-def synthesize_speech(text, voice_id, use_real_tts):
-    if not use_real_tts:
-        time.sleep(0.5)  # 가상 처리 시간
-        # 재생 가능한 1초 무음 WAV 생성 (비프음 데모 역할)
-        out = io.BytesIO()
-        with wave.open(out, 'wb') as f:
-            f.setnchannels(1)
-            f.setsampwidth(2)
-            f.setframerate(16000)
-            f.writeframes(struct.pack('h', 0) * 16000)
-        return out.getvalue(), 'audio/wav'
-
+def synthesize_speech(text, voice_id):
     mp3_bytes = asyncio.run(generate_tts_mp3(text, voice_id))
     return mp3_bytes, 'audio/mpeg'
 
